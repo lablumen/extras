@@ -32,13 +32,17 @@ The platform has been validated end-to-end on a single EC2 instance using `docke
 - **Edge / routing:** **One shared public ALB → K-Gateway (Envoy) → `HTTPRoute` path matching.**
 - **AI ingestion:** strictly the **S3-triggered AWS Lambda** (`serverless/ai-processing-pipeline`), VPC-attached
   to reach private RDS; the inline `report-service` AI path is retired.
-- **Repos:** the monorepo is decomposed into isolated infra / gitops / frontend / per-service repositories.
+- **Repos:** a **3-repo topology** — `lablumen-terraform` (infra), `lablumen-k8s` (GitOps), `lablumen-app`
+  (consolidated `/backend` + `/frontend` + `/serverless`); architecture docs in `extras`.
+- **Runtime config:** application pods read AWS Secrets Manager + SSM Parameter Store **directly via `boto3`/IRSA** —
+  no Kubernetes Secrets, ConfigMaps, CSI driver, or External Secrets Operator.
 
 ### 0.3 The two hard boundaries (non-negotiable)
 
 1. **Infra ⟂ App-deploy decoupling.** Terraform (infrastructure) and GitOps/CI (application releases) never share
-   privileges. Their *only* intersection is **managed secrets** (AWS Secrets Manager + GitHub Actions Secrets),
-   **manually populated by a human engineer**. No pipeline holds cross-boundary IAM.
+   privileges. Terraform publishes **managed config** — sensitive values into **AWS Secrets Manager**
+   (human-populated) and non-sensitive infra constants into **SSM Parameter Store** — which the application runtime
+   reads directly via `boto3`/IRSA. The GitOps plane stays config-blind. No pipeline holds cross-boundary IAM.
 2. **Lambda-native AI pipeline.** Document ingestion (Textract → Bedrock → pgvector) runs **only** inside the
    isolated Lambda, triggered by S3 `ObjectCreated`. EKS never performs OCR/embedding inline.
 
@@ -66,7 +70,7 @@ module.identity  -> Cognito user pool + IRSA (consumes module.eks.oidc_provider_
 | `data` | RDS Postgres 16, `db.t3.medium`, 20 GB, in **private app subnets** | Relocate into the **isolated DB subnet group**; add SG ingress from Lambda SG |
 | `storage` | Reports bucket + `module.ai_lambda` (python3.12, 512 MB, 60 s, S3 trigger wired) | Switch bucket to **default SSE-S3 (S3-managed keys)**; add Lambda **`VpcConfig`** + dedicated Lambda SG |
 | `messaging` | SQS `lablumen-notifications` + SES | (no change) consumed by notification-service via IRSA |
-| `identity` | Cognito + **IRSA foundation** (uses EKS OIDC ARN) | Extend IRSA roles for new addons (LBC, external-secrets, Karpenter controller) |
+| `identity` | Cognito + **IRSA foundation** (uses EKS OIDC ARN) | Add **per-service IRSA** granting scoped `secretsmanager:GetSecretValue` + `ssm:GetParameter(s)`; IRSA for LBC / Karpenter controller |
 
 > **Design-token correction (storage):** the reports bucket must use **default server-side encryption with
 > S3-managed keys (SSE-S3)**. Drop any explicit `aws:kms` server-side-encryption configuration. PHI confidentiality
@@ -103,25 +107,25 @@ k8s/
     ├── argocd.yaml
     ├── aws-load-balancer-controller.yaml  # chart 1.8.2, clusterName: lablumen-eks
     ├── karpenter.yaml
-    └── secrets-store-csi-driver.yaml
+    └── secrets-store-csi-driver.yaml       # ⚠ RETIRED by the direct-SDK model — removed in the config-model migration
 ```
 
 **Routing today:** each service Helm chart renders a per-service **`Ingress`** (`apps/*/templates/ingress.yaml`),
 materialized by the AWS Load Balancer Controller. **This is exactly what the K-Gateway model in §6 replaces.**
 
 The GitOps source of record is currently `github.com/rnld101/lablumen.git`, path `k8s`. The repo split (§3) moves
-this tree wholesale into **`lablumen-gitops-manifests`**.
+this tree wholesale into **`lablumen-k8s`**.
 
 ---
 
 ## 2. Separation of Concerns — Infra vs. App Deployments
 
-### 2.1 The boundary
+### 2.1 The boundary (three planes)
 
 ```
             TERRAFORM PLANE                          GITOPS / CI PLANE
    ┌──────────────────────────────┐        ┌──────────────────────────────────┐
-   │ lablumen-infra-terraform      │        │ lablumen-gitops-manifests         │
+   │ lablumen-terraform      │        │ lablumen-k8s         │
    │  • VPC / subnets / endpoints  │        │  • ArgoCD app-of-apps             │
    │  • EKS + Karpenter IAM        │        │  • Helm charts (apps/*)           │
    │  • RDS (pgvector)             │        │  • platform-addons/* (+k-gateway, │
@@ -132,58 +136,124 @@ this tree wholesale into **`lablumen-gitops-manifests`**.
                    │ writes outputs                            │ reads
                    ▼                                           ▼
          ┌───────────────────────────────────────────────────────────┐
-         │   AWS Secrets Manager  +  GitHub Actions Secrets           │
-         │   (THE ONLY HANDSHAKE — hand-populated by a human engineer)│
+         │  AWS Secrets Manager (sensitive)  +  SSM Parameter Store   │
+         │  (non-secret config)  +  GH Actions Secrets (CI → ECR)     │
+         │  Terraform WRITES ─── app pods READ at runtime (boto3+IRSA)│
          └───────────────────────────────────────────────────────────┘
 ```
 
-No Terraform run reads from the GitOps repo; no Argo/CI pipeline holds Terraform state or cross-account IAM.
+There are effectively **three** planes: Terraform *writes* managed config; the **GitOps/CI plane stays config-blind**
+(declarative manifests only); the **application runtime reads** config via `boto3`+IRSA. No Terraform run reads the
+GitOps repo; no Argo/CI pipeline holds Terraform state or cross-account IAM; the GitOps repo never reads secrets.
 
-### 2.2 What flows across the handshake
+### 2.2 What flows across the boundary
 
-Terraform **emits** these (already partly in `terraform/outputs.tf`); a human copies the sensitive ones into
-Secrets Manager / Actions Secrets:
+Terraform **emits** these. Sensitive values land in **Secrets Manager** (empty containers created by Terraform,
+values hand-populated by a human); non-sensitive infra constants are **published by Terraform into SSM Parameter
+Store**. Applications read both **at runtime via `boto3`** — nothing flows through Helm/ConfigMaps.
 
-| Value | Source (Terraform) | Consumer | Transport |
-|---|---|---|---|
-| RDS connection URL (`DATABASE_URL`) | `module.data` endpoint + creds | services (pods) + `ai_lambda` | Secrets Manager → ESO/CSI → pod env; Secrets Manager → Lambda env |
-| Reports bucket name / ARN | `module.storage` | report-service, `ai_lambda` | non-secret config (ConfigMap / values) |
-| EKS OIDC provider ARN | `module.eks` | IRSA role trust | Terraform-internal (`module.identity`) |
-| SQS queue URL | `module.messaging` | appointment + notification | non-secret config |
-| Cognito pool / client IDs | `module.identity` | frontend build + services | non-secret config |
-| ECR repo URIs | new (Phase 7) | CI image push, Helm `image.repository` | Actions Secrets / values |
+| Value | Source (Terraform) | Sink | Consumer | Retrieval |
+|---|---|---|---|---|
+| `DATABASE_URL` (DSN incl. creds) | `module.data` + RDS master secret | Secrets Manager `lablumen/app/database-url` | services + `ai_lambda` | boto3 `get_secret_value` (TTL cache) |
+| 3rd-party API keys / SMTP creds | human | Secrets Manager `lablumen/app/*` | owning service | boto3 `get_secret_value` (TTL cache) |
+| Reports bucket name | `module.storage` | SSM `/lablumen/config/reports-bucket` | report-service, `ai_lambda` | boto3 `get_parameter` (process cache) |
+| SQS queue URL | `module.messaging` | SSM `/lablumen/config/sqs-url` | appointment + notification | boto3 `get_parameter` (process cache) |
+| Cognito pool / client IDs | `module.identity` | SSM `/lablumen/config/cognito-*` | services + SPA build | boto3 `get_parameter` / build-time |
+| Bedrock model IDs | tfvars | SSM `/lablumen/config/bedrock-*` | report / ai | boto3 `get_parameter` |
+| EKS OIDC provider ARN | `module.eks` | Terraform-internal | IRSA trust | n/a |
+| ECR repo URIs | `aws_ecr_repository` | Helm `image.repository` + GH Actions | CI push + pods | git / Actions |
 
-> **Rule:** secrets never live in git. Non-secret topology (bucket names, queue URLs, pool IDs) may live in Helm
-> `values.yaml`; credentials and `DATABASE_URL` resolve at runtime via the **Secrets Store CSI driver / External
-> Secrets Operator** reading Secrets Manager.
+> **The one non-secret still in `lablumen-k8s`:** the ECR image URI (`image.repository`). It is part of the
+> *deployment manifest*, not application *configuration*. Everything the app code reads comes from SSM / Secrets
+> Manager, never from the chart.
+
+### 2.3 Identifier classification — the runtime contract
+
+Three lanes; the first two are read by the app at runtime via the SDK, and `lablumen-k8s` stays config-blind.
+
+| Identifier | Lane | Sink | Retrieval | Cache |
+|---|---|---|---|---|
+| `DATABASE_URL`, API keys, SMTP creds | 🔒 Secret | AWS Secrets Manager | boto3 `get_secret_value` | TTL (default 900 s) → live rotation |
+| Bucket names, SQS URL, Cognito IDs, model IDs | 📍 Config | SSM Parameter Store | boto3 `get_parameter(s)` | process lifetime (immutable constants) |
+| ECR image URI | 📦 Deploy manifest | `lablumen-k8s` `values.yaml` | n/a (Helm renders it) | n/a |
+
+> **Litmus test:** if leaking it forces a credential rotation → **Secret** (Secrets Manager, TTL cache). If it is
+> stable infra topology the app needs to find its dependencies → **Config** (SSM Parameter Store, process cache). If
+> it is only needed to *place* the container, not run its code → **Deploy manifest** (Helm values). Full lifecycle:
+> `extras/docs/SECRETS_AND_CONFIG.md`.
 
 ---
 
 ## 3. Multi-Repository Decomposition Strategy
 
-### 3.1 Target repositories
+### 3.0 Canonical naming lock (3-repo topology — locked 2026-06-20)
 
-| Repo | Holds | Migrated from |
+The platform is **three** active repositories plus the docs vault. All earlier multi-repo draft names
+(`lablumen-infra-terraform`, `lablumen-gitops-manifests`, and the per-service repos
+`lablumen-appointment-service` / `lablumen-report-service` / `lablumen-notification-service` /
+`lablumen-frontend` / `lablumen-ai-service`) are **retired** — their contents consolidate as below.
+
+| Repo | Role | Holds |
 |---|---|---|
-| `lablumen-infra-terraform` | VPC, subnets, endpoints, EKS, Karpenter IAM, RDS, S3, `ai_lambda`, SQS, SES, Cognito, IRSA, **bootstrap Helm for Gateway API CRDs** | `terraform/` |
-| `lablumen-gitops-manifests` | ArgoCD app-of-apps, `apps/*` Helm charts, `platform-addons/*` (+ `k-gateway`, `cluster-routing`), Karpenter `NodePool`/`EC2NodeClass`, `Gateway` + `HTTPRoute` | `k8s/` |
-| `lablumen-frontend` | React SPA source, `Dockerfile`, app-level tests | `frontend/` |
-| `lablumen-appointment-service` | FastAPI scheduling + seed engine, `alembic/` migrations, `Dockerfile`, tests | `backend/appointment-service/` |
-| `lablumen-report-service` | FastAPI reports/query + S3 presign (inline AI removed), `Dockerfile`, tests | `backend/report-service/` |
-| `lablumen-notification-service` | SQS consumer + SES emailer, `Dockerfile`, tests | `backend/notification-service/` |
-| `lablumen-ai-processing-service` *(or folded into report repo)* | S3-triggered Lambda (`serverless/ai-processing-pipeline`) | `serverless/ai-processing-pipeline/` |
+| `lablumen-terraform` | AWS infrastructure plane | VPC, EKS, ECR, RDS, S3, SQS, SES, Cognito, Secrets Manager *containers*, SSM Parameter Store keys, IRSA |
+| `lablumen-k8s` | GitOps declarative release plane | ArgoCD app-of-apps, `apps/*` Helm charts, `platform-addons/*` (incl. K-Gateway). **Config-blind** |
+| `lablumen-app` | Consolidated application source | `/backend` (microservices), `/frontend` (React SPA), `/serverless` (Lambda pipeline) |
+| `extras` | Documentation vault | blueprints, `CURRENT_STATUS.md`, `SECRETS_AND_CONFIG.md`, `MIGRATION_STATE_LEDGER.md` — no deployable code |
+
+**Image & in-cluster identity map** (uniformly **singular**; all images built from `lablumen-app` via CI path filters):
+
+| Workload | Source path (in `lablumen-app`) | ECR image repo | In-cluster identity (Service / Helm / Argo / HTTPRoute) |
+|---|---|---|---|
+| Appointment | `backend/appointment-service/` | `lablumen/appointment-service` | `appointment-service` |
+| Reports | `backend/report-service/` | `lablumen/report-service` | `report-service` |
+| Notification | `backend/notification-service/` | `lablumen/notification-service` | `notification-service` |
+| Frontend | `frontend/` | `lablumen/frontend` | `frontend` |
+| AI ingestion | `serverless/ai-processing-pipeline/` | — (zipped Lambda, no image) | `ai_lambda` (out-of-cluster) |
+
+> **Naming is uniformly singular** (`report-service`, not `reports-service`) across the running k8s Service, the
+> `lablumen-k8s/apps/report-service` chart, and the ECR image — matching the deployed tree. The earlier
+> singular/plural split is retired.
+>
+> **Open drift (flagged):** `lablumen-terraform/main.tf` sets
+> `module.storage.lambda_source_path = "../serverless/ai-processing-pipeline"` — valid only in a monorepo. With
+> `lablumen-terraform` and `lablumen-app` as separate repos, the Lambda zip must be **built in `lablumen-app` CI and
+> consumed by Terraform as an artifact** (published S3 object / build step). Resolve when wiring the AI bridge (ledger P6).
+
+### 3.1 CI path-filter build matrix (`lablumen-app`)
+
+One application repo, path-scoped pipelines: a push touching one service rebuilds only that service's image.
+Illustrative GitHub Actions trigger (authored later in `lablumen-app`, not here):
+
+```yaml
+# .github/workflows/appointment-service.yml   (one workflow per workload)
+on:
+  push:
+    paths: ['backend/appointment-service/**']
+jobs:
+  build-push:
+    # docker build backend/appointment-service → push lablumen/appointment-service:<git-sha> → ECR
+    # then PR-bump image.tag in lablumen-k8s/apps/appointment-service/values.yaml
+```
+
+| Path filter | Builds → pushes | Bumps tag in |
+|---|---|---|
+| `backend/appointment-service/**` | `lablumen/appointment-service` | `lablumen-k8s/apps/appointment-service` |
+| `backend/report-service/**` | `lablumen/report-service` | `lablumen-k8s/apps/report-service` |
+| `backend/notification-service/**` | `lablumen/notification-service` | `lablumen-k8s/apps/notification-service` |
+| `frontend/**` | `lablumen/frontend` | `lablumen-k8s/apps/frontend` (P8) |
+| `serverless/ai-processing-pipeline/**` | Lambda zip artifact | Terraform-consumed (no chart) |
 
 ### 3.2 Cross-cutting ownership decisions
 
-- **Migrations (`alembic/`)** travel with **`lablumen-appointment-service`** (it owns the initial schema +
-  seed: `0001_initial_schema.py`, `0002_seed_lab_tests.py`). The migration job is referenced (not duplicated)
-  by the GitOps `apps/` chart as an ArgoCD **PreSync** hook.
-- **Container registry:** one **ECR repository per service** (`lablumen/appointment-service`,
-  `lablumen/report-service`, `lablumen/notification-service`, `lablumen/frontend`,
-  `lablumen/ai-processing`). Repo URIs cross the handshake as non-secret config.
-- **Shared contracts:** OpenAPI/event schemas remain versioned in each producing service; consumers pin versions.
-- **GitOps source switch:** update `root-app.yaml` `repoURL` from `…/lablumen.git` to the new
-  `lablumen-gitops-manifests` repo during Phase 7.
+- **Migrations (`alembic/`)** live in `lablumen-app/backend/appointment-service` (owns `0001_initial_schema.py`,
+  `0002_seed_lab_tests.py`). The migration job is referenced (not duplicated) by the GitOps `apps/` chart as an
+  ArgoCD **PreSync** hook.
+- **Container registry:** one **ECR repo per containerized workload** (`lablumen/appointment-service`,
+  `lablumen/report-service`, `lablumen/notification-service`, `lablumen/frontend`) — all built from `lablumen-app`.
+  The AI pipeline ships as a **zipped Lambda — no ECR repo**.
+- **Runtime config:** application code reads Secrets Manager + SSM Parameter Store directly via `boto3`
+  (see `SECRETS_AND_CONFIG.md`); `lablumen-k8s` carries **no Secrets/ConfigMaps**.
+- **GitOps source:** `root-app.yaml` `repoURL` points at `lablumen-k8s`.
 
 ---
 
@@ -256,7 +326,8 @@ and is not on the AI hot path.
 | `com.amazonaws.us-east-1.s3` | **Gateway** | Lambda + nodes pull report objects and ECR layers without NAT |
 | `com.amazonaws.us-east-1.textract` | Interface | VPC-attached Lambda reaches Textract privately |
 | `com.amazonaws.us-east-1.bedrock-runtime` | Interface | VPC-attached Lambda invokes Bedrock (Titan embed, Nova text) privately |
-| `com.amazonaws.us-east-1.secretsmanager` | Interface | Lambda + ESO/CSI resolve `DATABASE_URL` privately |
+| `com.amazonaws.us-east-1.secretsmanager` | Interface | Pods (boto3) + Lambda resolve secrets (`DATABASE_URL`, keys) privately |
+| `com.amazonaws.us-east-1.ssm` | Interface | Pods (boto3) read SSM Parameter Store config privately (off the NAT path) |
 | `com.amazonaws.us-east-1.ecr.api` / `ecr.dkr` | Interface | Nodes pull service images privately |
 | `com.amazonaws.us-east-1.logs` | Interface | CloudWatch Logs from in-VPC Lambda + nodes |
 | `com.amazonaws.us-east-1.sqs` | Interface | notification-service + Karpenter interruption queue |
@@ -329,9 +400,9 @@ bootstrap options:
   exists" atomic), **or**
 - a one-time `kubectl apply -f root-app.yaml` seed after a manual ArgoCD install.
 
-Either way, `root-app` then continuously reconciles everything under `k8s/` (now `lablumen-gitops-manifests`).
+Either way, `root-app` then continuously reconciles everything under `k8s/` (now `lablumen-k8s`).
 
-### 6.2 Target repository layout (`lablumen-gitops-manifests`)
+### 6.2 Target repository layout (`lablumen-k8s`)
 
 ```
 gitops/
@@ -350,9 +421,9 @@ gitops/
     ├── argocd.yaml
     ├── aws-load-balancer-controller.yaml   # now manages ONE shared ALB → K-Gateway
     ├── karpenter.yaml                       # + NodePool / EC2NodeClass
-    ├── secrets-store-csi-driver.yaml
     ├── k-gateway/              # NEW — Helm charts: K-Gateway control plane + Envoy data plane
     └── cluster-routing/        # NEW — Gateway API CRDs + Gateway + HTTPRoute resources
+                                #   (NO secrets-store-csi-driver — apps read SSM/Secrets Manager via boto3)
 ```
 
 ### 6.3 The K-Gateway routing topology (replaces per-service Ingress)
@@ -422,11 +493,14 @@ spec:
 > More-specific prefixes (`/api/v1/reports`) must out-rank the broad `/api/v1` per Gateway API precedence — keep
 > them in separate `HTTPRoute`s so K-Gateway resolves longest-prefix-wins.
 
-### 6.4 Secrets into pods (closing the handshake)
+### 6.4 Runtime config (direct AWS SDK — no CSI/ESO, no K8s Secrets/ConfigMaps)
 
-`DATABASE_URL` and any credential are resolved at pod start via the **Secrets Store CSI driver** (already in
-`platform-addons/secrets-store-csi-driver.yaml`) / **External Secrets Operator** reading **AWS Secrets Manager**.
-No secret material is committed to the GitOps repo — charts reference secret *names*, not values.
+Application config does **not** flow through Kubernetes. Each pod, authenticated by its **IRSA** service account,
+reads **AWS Secrets Manager** (sensitive — `boto3 get_secret_value`, TTL-cached for live rotation) and **SSM
+Parameter Store** (non-sensitive infra constants — `boto3 get_parameter`, process-cached) **at startup**. There is
+no `SecretProviderClass`, no External Secrets `ExternalSecret`, no CSI-mounted volume, and no `Secret`/`ConfigMap`
+in the charts. Bootstrap implements retry-with-backoff and **fails closed** if mandatory config is unavailable.
+Full lifecycle: `extras/docs/SECRETS_AND_CONFIG.md`.
 
 ### 6.5 Sync waves & root-app glob
 
@@ -440,7 +514,7 @@ No secret material is committed to the GitOps repo — charts reference secret *
 
 ### 6.6 Image-tag promotion
 
-CI builds and pushes immutable image tags (git SHA) to ECR, then opens a PR against `lablumen-gitops-manifests`
+CI builds and pushes immutable image tags (git SHA) to ECR, then opens a PR against `lablumen-k8s`
 bumping the chart `image.tag`. ArgoCD detects the commit and syncs. Promotion = a git commit, never a direct
 `kubectl`/`helm` apply.
 
@@ -473,7 +547,7 @@ chat/summary read path. Its inline `bedrock.py` / `textract.py` / `ingestion.py`
 | Lambda SG (new) | `lablumen-ai-lambda-sg` — no inbound; egress `443` (AWS APIs via endpoints) + `5432` to RDS SG |
 | RDS SG rule (new) | Ingress `5432` **from `lablumen-ai-lambda-sg`** (and from the EKS node SG for services) |
 | AWS API reachability | Textract / Bedrock / Secrets Manager / S3 reached via the **VPC endpoints** in §4.4 (a VPC-attached Lambda loses default internet egress, so endpoints are mandatory) |
-| `DATABASE_URL` | injected from **Secrets Manager** at deploy time (already noted in `modules/storage`) |
+| `DATABASE_URL` | resolved from **Secrets Manager** at runtime via `boto3` (TTL-cached); never baked into the zip |
 
 ### 7.3 `VpcConfig` block shape to add to `module.ai_lambda`
 
@@ -488,7 +562,8 @@ through subnet/SG inputs sourced from `module.network` and a new Lambda SG:
 
   environment_variables = {
     BEDROCK_EMBED_MODEL_ID = "amazon.titan-embed-text-v1"
-    BEDROCK_TEXT_MODEL_ID  = "amazon.nova-2-lite-v1:0"
+    # us-east-1 on-demand only — org SCP p-rn6vr8ok denies the Nova 2 inference-profile regions.
+    BEDROCK_TEXT_MODEL_ID  = "amazon.nova-lite-v1:0"
     # DATABASE_URL injected from Secrets Manager at deploy time
   }
 ```
@@ -524,15 +599,15 @@ Each phase is **build → test → lock** (do not start the next phase until the
 
 | Phase | Build | Test | Lock criteria |
 |---|---|---|---|
-| **P0 — Foundations** | Terraform remote state (S3 + DynamoDB lock); Secrets Manager namespaces; ECR repos | `terraform plan` clean; secrets readable by intended principals only | State backend + secret scaffolding immutable & reviewed |
+| **P0 — Foundations** | Terraform remote state (S3 + DynamoDB lock); Secrets Manager containers; **SSM Parameter Store baseline paths**; ECR repos | `terraform plan` clean; secrets/params readable by intended principals only | State backend + secret/param scaffolding immutable & reviewed |
 | **P1 — Network** | Add `database_subnets` tier; add VPC endpoints (§4.4); keep single NAT | Endpoint DNS resolves in-VPC; routing tables correct per tier | Subnet CIDRs + endpoints locked; tags verified |
 | **P2 — Data** | Move RDS into the **isolated DB subnet group**; SG baseline | Connectivity only from app tier; no public route | RDS endpoint published to Secrets Manager; tier isolation confirmed |
 | **P3 — EKS core** | EKS + **bootstrap-only** MNG + Karpenter controller IAM/instance-profile/interruption queue | Cluster reachable; bootstrap nodes Ready; discovery tags present | Control-plane + bootstrap capacity locked |
-| **P4 — Gateway CRDs + add-ons** | **Bootstrap the standard Kubernetes Gateway API CRDs via the Terraform Helm provider FIRST**, then install ArgoCD + sync `platform-addons` (LBC, Karpenter, CSI, **k-gateway**) | `kubectl get crd` shows `gateway.networking.k8s.io`; ArgoCD healthy; K-Gateway control plane up | Gateway API CRDs exist **before** any `HTTPRoute` syncs; addons green |
+| **P4 — Gateway CRDs + add-ons** | **Bootstrap the standard Kubernetes Gateway API CRDs via the Terraform Helm provider FIRST**, then install ArgoCD + sync `platform-addons` (LBC, Karpenter, **k-gateway**; no CSI) | `kubectl get crd` shows `gateway.networking.k8s.io`; ArgoCD healthy; K-Gateway control plane up | Gateway API CRDs exist **before** any `HTTPRoute` syncs; addons green |
 | **P5 — Karpenter live** | Apply `NodePool`/`EC2NodeClass` via GitOps; scale-test; then retire static nodes | Pending pods trigger CreateFleet; consolidation works; spot interruption drains cleanly | Real capacity on Karpenter; bootstrap MNG at min |
 | **P6 — AI bridge** | Add `ai_lambda` `VpcConfig` + Lambda SG + RDS ingress rule; remove report-service inline AI path | Upload → S3 event → Lambda → Textract/Bedrock via endpoints → pgvector write; report-service query reads vectors | Ingestion 100% via Lambda; inline path deleted |
-| **P7 — Repo split + delivery** | Split monorepo into target repos; wire CI image push to ECR; move `k8s/` into `lablumen-gitops-manifests`; repoint `root-app` | Each service builds/tests in its repo; ArgoCD tracks the new gitops repo | Monorepo frozen; per-repo pipelines green |
-| **P8 — Routing cutover** | Stand up `lablumen-frontend` repo; deploy the **shared-ALB → K-Gateway** wiring and the per-service **`HTTPRoute`** manifests (replacing the old per-service ALB Ingress) | `/api/v1/reports` and `/api/v1/` resolve through the single ALB → K-Gateway → correct service | One public ALB only; HTTPRoutes authoritative; service Ingress removed |
+| **P7 — Repo split + delivery** | Consolidate into **3 repos** (`lablumen-terraform` / `lablumen-k8s` / `lablumen-app`); CI **path filters** in `lablumen-app` build+push per-service images to ECR; repoint `root-app` at `lablumen-k8s` | Each path-filtered workflow builds/tests its workload; ArgoCD tracks `lablumen-k8s` | Monorepo frozen; per-workload pipelines green |
+| **P8 — Routing cutover** | Deploy the frontend (`lablumen-app/frontend`) and the **shared-ALB → K-Gateway** wiring and the per-service **`HTTPRoute`** manifests (replacing the old per-service ALB Ingress) | `/api/v1/reports` and `/api/v1/` resolve through the single ALB → K-Gateway → correct service | One public ALB only; HTTPRoutes authoritative; service Ingress removed |
 | **P9 — Decommission** | Cut DNS to the new ALB; drain compose; archive EC2 stack | Full E2E on EKS; no traffic to compose | `docker-compose.yml` retired; EKS is sole runtime |
 
 ---
@@ -548,7 +623,7 @@ Each phase is **build → test → lock** (do not start the next phase until the
 | Tags | `{ Project = "lablumen", ManagedBy = "terraform" }` merged via provider `default_tags` |
 | Module boundary | one module per AWS domain (`network`/`eks`/`data`/`storage`/`messaging`/`identity`); modules expose typed outputs, never reach across each other except through `main.tf` wiring |
 | Discovery | subnet/SG `karpenter.sh/discovery = <cluster>`, `kubernetes.io/role/*-elb` — tag-based, no hard-coded ARNs |
-| Secrets | values resolved at runtime from Secrets Manager; never in `*.tfvars` committed to git |
+| Secrets / config | sensitive → Secrets Manager; non-sensitive → SSM Parameter Store; both read at runtime via `boto3`/IRSA; never in `*.tfvars` or git |
 | Region pin | `us-east-1` (org SCP constraint — see Bedrock model note in `docker-compose.yml`) |
 
 ### 9.2 "What changes per existing module" — quick reference
@@ -559,10 +634,11 @@ Each phase is **build → test → lock** (do not start the next phase until the
 | `modules/eks` | bootstrap MNG → `min1/desired1/max2`; Karpenter `NodePool`/`EC2NodeClass` move to GitOps |
 | `modules/data` | RDS → isolated DB subnet group; + ingress from Lambda SG |
 | `modules/storage` | bucket → **SSE-S3**; `ai_lambda` → `VpcConfig` + `lablumen-ai-lambda-sg` |
-| `modules/identity` | + IRSA roles for LBC / Karpenter controller / external-secrets |
-| root (`lablumen-infra-terraform`) | + Helm-provider bootstrap of **Gateway API CRDs** (P4) |
-| `k8s/` → `lablumen-gitops-manifests` | + `platform-addons/k-gateway`, + `platform-addons/cluster-routing`; **remove** `apps/*/templates/ingress.yaml`; update `root-app.yaml` include glob + `repoURL` |
-| `backend/report-service` | remove inline `bedrock.py`/`textract.py`/`ingestion.py` |
+| `secrets.tf` / `ssm.tf` (root, new) | Secrets Manager *containers* (no `_version`) + SSM Parameter Store config keys (`/lablumen/config/*`) |
+| `modules/identity` | + **per-service IRSA** (scoped `secretsmanager:GetSecretValue` + `ssm:GetParameter(s)`); IRSA for LBC / Karpenter controller |
+| root (`lablumen-terraform`) | + Helm-provider bootstrap of **Gateway API CRDs** (P4) |
+| `k8s/` → `lablumen-k8s` | + `platform-addons/k-gateway`, + `platform-addons/cluster-routing`; **remove** `apps/*/templates/ingress.yaml`; **remove** `secrets-store-csi-driver`; charts carry **no Secrets/ConfigMaps**; update `root-app.yaml` include glob + `repoURL` |
+| `lablumen-app/backend/report-service` | remove inline `bedrock.py`/`textract.py`/`ingestion.py` (AI flows through the Lambda) |
 | `docker-compose.yml` | retired at P9 |
 
 ### 9.3 End-state topology (single picture)
@@ -579,8 +655,8 @@ S3 reports ─(ObjectCreated)─► ai_lambda (VPC) ─endpoints─► Textract/
                                        │
                               [Isolated DB tier] RDS Postgres + pgvector  (5432, SG-scoped)
 
-Terraform plane ──outputs──► Secrets Manager / GH Actions Secrets ◄──reads── GitOps/CI plane
-                              (only handshake, human-populated)
+Terraform ──writes──► Secrets Manager + SSM Parameter Store ◄──reads at runtime (boto3+IRSA)── app pods
+                       (GitOps plane is config-blind; CI uses GH Actions Secrets only to push images to ECR)
 ```
 
 ---
